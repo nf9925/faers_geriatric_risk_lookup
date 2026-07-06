@@ -63,7 +63,7 @@
      step gets built.
    ===================================================================== */
 
-        USE FAERS;
+USE FAERS;
 GO
 
 -- =====================================================================
@@ -493,22 +493,24 @@ FROM rates;
 SELECT TOP 20 * FROM #leaderboard ORDER BY n_total DESC;
 
 /* =====================================================================
-  j. Ranking drugs by the LOWER bound of the CI on the hospitalization age
-   penalty. Drugs at the top show a statistically supported pattern
-   of hospitalization rates climbing with age. Drugs with wide CIs
-   sink, since their lower bounds are small even when point estimates
-   look dramatic.
- 
+  j. Full hospitalization leaderboard covering every drug in the analysis,
+  ordered by CI lower bound. Drugs with strong statistical support land
+  at the top. Drugs with weaker signals or missing CI values still appear,
+  so a clinician looking up any medication finds whatever the data holds.
+
+   What changed from the earlier version:
+     Removed the TOP 50 cap and the WHERE filter that dropped drugs
+     with CI lower bound below 1. Result covers every drug that had
+     cases in both the youngest and oldest age brackets.
+
    Justification:
-     - Ranking by the lower CI bound, not the point estimate, is the
-       standard pharmacovigilance practice. It rewards drugs where we
-       can be confident the elevation is real, while still keeping
-       uncertain ones in the analysis
-     - The TOP 50 cap keeps the output readable. Adjust upward when
-       you want to see further down the list
+     A clinician searching for a specific drug should not hit a blank
+     because the drug fell outside a top 50 cap or below a threshold.
+     Empty ratio and CI columns are more honest than the drug being
+     absent entirely.
    ===================================================================== */
- 
-SELECT TOP 50
+
+SELECT
     drug,
     n_total,
     n_young, n_old,
@@ -519,23 +521,18 @@ SELECT TOP 50
     ROUND(hosp_ratio_ci_lower, 2) AS ci_lower,
     ROUND(hosp_ratio_ci_upper, 2) AS ci_upper
 FROM #leaderboard
-WHERE hosp_ratio_ci_lower IS NOT NULL
-  AND hosp_ratio_ci_lower > 1                     
 ORDER BY hosp_ratio_ci_lower DESC;
  
- /* =====================================================================
-  k. Ranking drugs by the LOWER bound of the CI on the death age penalty.
-    Mirror of Step j but for the death outcome. Drugs appearing at the
-    top of both leaderboards are the ones most likely to punish older
-    bodies through genuine drug pharmacology.
+/* =====================================================================
+  k. Full death leaderboard covering every drug in the analysis, ordered
+  by CI lower bound. Same change as step j but for the death outcome.
 
-    Caution: the top of this leaderboard will contain oncology and other
-    terminal disease drugs, where deaths reflect the underlying illness
-    rather than the medication. Step n handles that confounder with an
-    oncology sensitivity check.
+   Caution: expect oncology and other terminal disease drugs at or near
+   the top. Step n handles that confounder with an oncology sensitivity
+   check.
    ===================================================================== */
- 
-SELECT TOP 50
+
+SELECT
     drug,
     n_total,
     n_young, n_old,
@@ -546,8 +543,6 @@ SELECT TOP 50
     ROUND(death_ratio_ci_lower, 2) AS ci_lower,
     ROUND(death_ratio_ci_upper, 2) AS ci_upper
 FROM #leaderboard
-WHERE death_ratio_ci_lower IS NOT NULL
-  AND death_ratio_ci_lower > 1
 ORDER BY death_ratio_ci_lower DESC;
 
 
