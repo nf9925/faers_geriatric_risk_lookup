@@ -1,0 +1,720 @@
+/* =====================================================================
+   GERIATRIC DRUG AGING GRADIENT PROJECT
+   ---------------------------------------------------------------------
+   Research question:
+     As patients get older, which drugs show the biggest rise in
+     hospitalization and death reports?
+ 
+   Data:
+     FAERS 2026 Q1, single quarter, already loaded as
+     DEMO26Q1, DRUG26Q1, REAC26Q1, OUTC26Q1 in the FAERS database.
+ 
+   Method, in plain words:
+     1. Clean the age column so every row has a real number of years
+     2. Build age brackets: 18 to 44, 45 to 64, 65 to 74, 75 to 84, 85+
+     3. Flag each report for whether it ended in hospitalization or death
+     4. For each drug, count how many cases fall in each age bracket and
+        how many of those ended in hospitalization or death
+     5. For each drug, compute the rate of each outcome in the youngest
+        and oldest brackets, then the ratio between them. That ratio is
+        the AGE PENALTY: how many times higher the rate is in the elderly
+        compared to the youngest adults
+     6. Compute a 95 percent confidence interval for the age penalty
+        using the log normal approximation for a ratio of proportions
+     7. Rank drugs by the LOWER bound of the confidence interval, not
+        the point estimate. Statistically rigorous and resists the noise
+        from small samples without dropping any drug
+     8. Produce two outputs: a main leaderboard for stable signals, and
+        a secondary spotlight for high signal but low confidence drugs
+        that deserve follow up
+ 
+   Methodological choices and their justifications:
+     - Filter to role_cod = 'PS' (primary suspect) so the drug was
+       genuinely under suspicion as the cause of the outcome, not just
+       riding along as a concomitant medication
+     - Use prod_ai (active ingredient) rather than drugname (messy brand
+       text) for the drug identity, so brand variations collapse into
+       the same ingredient
+     - Keep every drug in the analysis, ranking by CI lower bound so
+       small sample drugs sink without being thrown out
+     - Include adults aged 18 and above only, since this is a geriatric
+       comparison and pediatrics would muddy the youngest bracket
+ 
+   Known limitations:
+     - Single quarter, so rare drugs will have wide intervals
+     - Oncology drugs will produce inflated death signals because the
+       underlying cancer, not the drug, often drove the death. Address
+       in a sensitivity analysis after seeing first results
+    - FAERS counts reports, not patients. The story is comparative,
+       never a true incidence rate
+   ===================================================================== */
+
+/* =====================================================================
+   EXPLORATORY DATA ANALYSIS (EDA)
+   ---------------------------------------------------------------------
+   Before jumping into the analytical pipeline, exploring what the raw
+   data actually looks like sets the ground. Each query below answers
+   one specific question about the shape, completeness, or distribution
+   of the FAERS 2026 Q1 data.
+
+   Justification:
+   Running these checks first surfaces missing
+     values, unexpected distributions, and skew before any downstream
+     step gets built.
+   ===================================================================== */
+
+        USE FAERS;
+GO
+
+-- =====================================================================
+-- EDA 1: Total row counts per table
+-- Just knowing how many rows sit in each table before analysis begins
+-- =====================================================================
+SELECT 'DEMO26Q1' AS table_name, COUNT(*) AS n_rows FROM DEMO26Q1
+UNION ALL
+SELECT 'DRUG26Q1', COUNT(*) FROM DRUG26Q1
+UNION ALL
+SELECT 'REAC26Q1', COUNT(*) FROM REAC26Q1
+UNION ALL
+SELECT 'OUTC26Q1', COUNT(*) FROM OUTC26Q1;
+-- Rows are not equal across tables because one report can carry multiple
+-- drugs, reactions, and outcomes. DEMO holds one row per report.
+
+-- =====================================================================
+-- EDA 2: Missing values in key demographic columns
+-- Reveals how much cleanup the demographics need before analysis
+-- =====================================================================
+SELECT
+    COUNT(*) AS total_reports,
+    SUM(CASE WHEN age IS NULL OR age = '' THEN 1 ELSE 0 END) AS missing_age,
+    SUM(CASE WHEN sex IS NULL OR sex = '' THEN 1 ELSE 0 END) AS missing_sex,
+    SUM(CASE WHEN reporter_country IS NULL OR reporter_country = '' THEN 1 ELSE 0 END) AS missing_country,
+    CAST(SUM(CASE WHEN age IS NULL OR age = '' THEN 1 ELSE 0 END) AS FLOAT) * 100
+        / COUNT(*) AS pct_missing_age
+FROM DEMO26Q1;
+-- Age missingness matters most for this project since the whole analysis
+-- is age stratified.
+
+-- =====================================================================
+-- EDA 3: Age distribution summary
+-- Provides mean, median, min, and max age for reports with valid year age
+-- =====================================================================
+SELECT
+    COUNT(*) AS n_valid_ages,
+    MIN(TRY_CAST(age AS INT)) AS min_age,
+    MAX(TRY_CAST(age AS INT)) AS max_age,
+    AVG(CAST(TRY_CAST(age AS INT) AS FLOAT)) AS mean_age
+FROM DEMO26Q1
+WHERE age_cod = 'YR'
+  AND TRY_CAST(age AS INT) IS NOT NULL
+  AND TRY_CAST(age AS INT) BETWEEN 0 AND 110;
+-- No MEDIAN function in T-SQL, so mean stands in as the central tendency.
+-- A median approximation using PERCENTILE_CONT lives in EDA 3b below.
+
+-- =====================================================================
+-- EDA 3b: Median age using PERCENTILE_CONT
+-- More honest central tendency than mean, since age distribution skews
+-- =====================================================================
+SELECT DISTINCT
+    PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY CAST(TRY_CAST(age AS INT) AS FLOAT))
+        OVER () AS median_age
+FROM DEMO26Q1
+WHERE age_cod = 'YR'
+  AND TRY_CAST(age AS INT) IS NOT NULL
+  AND TRY_CAST(age AS INT) BETWEEN 0 AND 110;
+
+-- =====================================================================
+-- EDA 4: Sex distribution
+-- Confirms whether reports skew heavily toward one sex, which would
+-- shape any subgroup analysis later
+-- =====================================================================
+SELECT
+    sex,
+    COUNT(*) AS n_reports,
+    CAST(COUNT(*) AS FLOAT) * 100 / SUM(COUNT(*)) OVER () AS pct
+FROM DEMO26Q1
+GROUP BY sex
+ORDER BY n_reports DESC;
+-- Expect F, M, blank, and occasionally UNK. Female skew is common in
+-- FAERS because women report adverse events more often.
+
+-- =====================================================================
+-- EDA 5: Top 20 reporter countries
+-- Shows the geographic footprint of who is submitting reports
+-- =====================================================================
+SELECT TOP 20
+    reporter_country,
+    COUNT(*) AS n_reports
+FROM DEMO26Q1
+WHERE reporter_country IS NOT NULL AND reporter_country <> ''
+GROUP BY reporter_country
+ORDER BY n_reports DESC;
+-- US dominance is expected. Non US countries submit through their own
+-- regulators and forward severe events to the FDA.
+
+-- =====================================================================
+-- EDA 6: Top 20 most reported drugs by active ingredient
+-- Sets baseline expectations for which drugs will dominate any leaderboard
+-- =====================================================================
+SELECT TOP 20
+    UPPER(LTRIM(RTRIM(prod_ai))) AS drug,
+    COUNT(DISTINCT primaryid) AS n_reports
+FROM DRUG26Q1
+WHERE role_cod = 'PS'
+  AND prod_ai IS NOT NULL
+  AND LTRIM(RTRIM(prod_ai)) <> ''
+GROUP BY UPPER(LTRIM(RTRIM(prod_ai)))
+ORDER BY n_reports DESC;
+-- Tirzepatide, semaglutide, and other trending drugs usually top the list.
+
+-- =====================================================================
+-- EDA 7: Top 20 most reported reactions
+-- Shows what kinds of adverse events dominate the reaction table
+-- =====================================================================
+SELECT TOP 20
+    pt AS reaction,
+    COUNT(*) AS n_reports
+FROM REAC26Q1
+WHERE pt IS NOT NULL AND pt <> ''
+GROUP BY pt
+ORDER BY n_reports DESC;
+-- General reactions like nausea and fatigue dominate, since they apply
+-- across many drug classes.
+
+-- =====================================================================
+-- EDA 8: Full outcome distribution
+-- Adds percentages to the raw counts from Step 0b for clearer reading
+-- =====================================================================
+SELECT
+    outc_cod,
+    COUNT(*) AS n_reports,
+    CAST(COUNT(*) AS FLOAT) * 100 / SUM(COUNT(*)) OVER () AS pct
+FROM OUTC26Q1
+GROUP BY outc_cod
+ORDER BY n_reports DESC;
+
+-- =====================================================================
+-- EDA 9: Sex by outcome cross tabulation
+-- Reveals whether sex distribution differs across serious outcomes
+-- =====================================================================
+SELECT
+    de.sex,
+    SUM(CASE WHEN oc.outc_cod = 'HO' THEN 1 ELSE 0 END) AS n_hospitalization,
+    SUM(CASE WHEN oc.outc_cod = 'DE' THEN 1 ELSE 0 END) AS n_death,
+    COUNT(DISTINCT de.primaryid) AS n_total_reports
+FROM DEMO26Q1 de
+LEFT JOIN OUTC26Q1 oc ON de.primaryid = oc.primaryid
+WHERE de.sex IN ('F', 'M')
+GROUP BY de.sex;
+-- Useful sanity check before deciding whether to stratify anything by sex.
+
+-- =====================================================================
+-- EDA 10: Reports by year of the event
+-- Shows how much of the quarter's data references older events
+-- =====================================================================
+SELECT
+    LEFT(event_dt, 4) AS event_year,
+    COUNT(*) AS n_reports
+FROM DEMO26Q1
+WHERE event_dt IS NOT NULL AND LEN(event_dt) >= 4
+GROUP BY LEFT(event_dt, 4)
+ORDER BY event_year DESC;
+-- A single FAERS quarter includes reports about events from many past
+-- years, since regulators receive delayed reports for old cases.
+
+/*=========================================*/
+/* MAIN ANALYSIS */
+/*=========================================*/
+
+USE FAERS;
+GO
+
+-- a. Checking what units the age column uses, since FAERS allows years, months, decades, and others. I only want years.
+SELECT age_cod, COUNT(*) AS n_reports
+FROM DEMO26Q1
+GROUP BY age_cod
+ORDER BY n_reports DESC;
+-- Expectation: YR dominates. Other units exist but are a small minority.
+
+-- b. Checking the outcome codes present in OUTC26Q1.
+-- I am focusing on DE (death) and HO (hospitalization).
+SELECT outc_cod, COUNT(*) AS n_reports
+FROM OUTC26Q1
+GROUP BY outc_cod
+ORDER BY n_reports DESC;
+-- Expectation: DE and HO should both be present in large numbers.
+
+-- c. Checking the role codes in DRUG26Q1.
+-- I will keep only PS (primary suspect) to focus on drugs genuinely under suspicion, not concomitants.
+SELECT role_cod, COUNT(*) AS n_rows
+FROM DRUG26Q1
+GROUP BY role_cod
+ORDER BY n_rows DESC;
+-- Expectation: PS, SS (secondary suspect), C (concomitant), I (interacting).
+
+/* =====================================================================
+d. Building a working copy of DEMO that contains only reports where age is
+   recorded in years, is a real number, and falls inside a reasonable
+   adult range. Each row also gets an age bracket assigned with CASE WHEN.
+ 
+   Justification:
+     - TRY_CAST converts the text age column to a number, returning
+       NULL when the text is junk. 
+     - The bracket cutoffs match standard adult age groups used widely
+       in pharmacovigilance
+     - Filtering to age >= 18 keeps the analysis adult focused, since
+       pediatric pharmacology is a separate field with separate dosing
+   ===================================================================== */
+   
+   DROP TABLE IF EXISTS #clean_demo;
+SELECT
+    primaryid,
+    TRY_CAST(age AS INT) AS age_years,
+    CASE
+        WHEN TRY_CAST(age AS INT) BETWEEN 18 AND 44 THEN '18-44'
+        WHEN TRY_CAST(age AS INT) BETWEEN 45 AND 64 THEN '45-64'
+        WHEN TRY_CAST(age AS INT) BETWEEN 65 AND 74 THEN '65-74'
+        WHEN TRY_CAST(age AS INT) BETWEEN 75 AND 84 THEN '75-84'
+        WHEN TRY_CAST(age AS INT) >= 85           THEN '85+'
+        ELSE NULL
+    END AS age_bracket
+INTO #clean_demo
+FROM DEMO26Q1
+WHERE age_cod = 'YR'                                 -- years only
+  AND TRY_CAST(age AS INT) IS NOT NULL               -- age must be numeric
+  AND TRY_CAST(age AS INT) BETWEEN 18 AND 110;       -- adult, plausible upper bound
+ 
+-- Quick sanity check on the bracket distribution
+SELECT age_bracket, COUNT(*) AS n_reports
+FROM #clean_demo
+GROUP BY age_bracket
+ORDER BY age_bracket;
+-- Expectation: every bracket should have a meaningful count, with the
+-- biggest groups usually in 45-64 and 65-74 since older patients take
+-- more medication.
+
+/* =====================================================================
+ e. For each unique report, now building two flags showing whether the report
+   ended in hospitalization or death. A single report can carry
+   multiple outcome codes, so collapsing all OUTC rows for the same
+   primaryid into one summary row using MAX with CASE WHEN.
+ 
+   Justification:
+     - Working with one flag per report later prevents row multiplication
+       during joins, which would inflate every count we compute
+     - MAX of a 0 or 1 flag returns 1 if the flag is true for any row,
+       which is exactly what "did this report ever record HO" means
+   ===================================================================== */
+DROP TABLE IF EXISTS #outcome_flags;
+SELECT
+    primaryid,
+    MAX(CASE WHEN outc_cod = 'HO' THEN 1 ELSE 0 END) AS had_hospitalization,
+    MAX(CASE WHEN outc_cod = 'DE' THEN 1 ELSE 0 END) AS had_death
+INTO #outcome_flags
+FROM OUTC26Q1
+GROUP BY primaryid;
+ 
+-- Sanity check
+SELECT TOP 20 * FROM #outcome_flags;
+
+/* =====================================================================
+f.  Joining cleaned demographics + drug + outcome flags into one row per
+   (drug, report) combination. Filtering to primary suspect drugs only
+   and dropping reports with no age bracket.
+ 
+   Justification:
+     - SELECT DISTINCT prevents row multiplication when the same drug
+       appears more than once on a single report under different
+       drug_seq values
+     - LEFT JOIN on outcome flags is important. Reports with no entry
+       in OUTC at all simply mean no serious outcome was recorded,
+       which is information we want to keep, not a reason to drop the row
+     - COALESCE turns NULL flag values into 0 so the arithmetic below works
+   ===================================================================== */
+ 
+DROP TABLE IF EXISTS #analysis;
+ SELECT DISTINCT
+    UPPER(LTRIM(RTRIM(d.prod_ai))) AS drug,        -- normalize spacing and case
+    cd.age_bracket,
+    cd.primaryid,
+    COALESCE(of_.had_hospitalization, 0) AS had_hospitalization,
+    COALESCE(of_.had_death,           0) AS had_death
+INTO #analysis
+FROM #clean_demo            AS cd
+JOIN DRUG26Q1               AS d  ON cd.primaryid = d.primaryid
+LEFT JOIN #outcome_flags    AS of_ ON cd.primaryid = of_.primaryid
+WHERE d.role_cod = 'PS'                              -- primary suspect only
+  AND d.prod_ai IS NOT NULL
+  AND LTRIM(RTRIM(d.prod_ai)) <> ''                  -- ignore blank ingredient
+  AND cd.age_bracket IS NOT NULL;
+ 
+-- Sanity check
+SELECT TOP 20 * FROM #analysis;
+
+/* =====================================================================
+ g. Counting how many cases each drug has in each age bracket, and how many
+   ended in hospitalization or death.
+ 
+   Justification:
+     - After Step 3's DISTINCT, each row in #analysis is one
+       (drug, primaryid, age bracket), so COUNT(*) safely counts cases
+     - SUM of a 0 or 1 flag gives the total number of cases where the
+       flag was true. Cleaner than COUNT with WHERE for two metrics at once
+   ===================================================================== */
+ 
+DROP TABLE IF EXISTS #agg;
+ 
+SELECT
+    drug,
+    age_bracket,
+    COUNT(*)                  AS n_cases,
+    SUM(had_hospitalization)  AS n_hosp,
+    SUM(had_death)            AS n_death
+INTO #agg
+FROM #analysis
+GROUP BY drug, age_bracket;
+ 
+-- Sanity check on a familiar drug
+SELECT *
+FROM #agg
+WHERE drug LIKE '%SEMAGLUTIDE%'
+ORDER BY age_bracket;
+
+/* ====================================================================
+  h.  Reshaping the aggregate so each drug has a single row containing the
+   case and event counts for the youngest bracket (18-44) and the oldest
+   bracket (85+). This is the data shape I need to compute the age
+   penalty in the next step.
+ 
+   Justification:
+     - Conditional aggregation with SUM(CASE WHEN ...) is the classic
+       SQL pivot trick. Each CASE WHEN picks rows for one bracket and
+       zeros out the rest, so the SUM returns just that bracket's count
+     - n_total across all brackets is included for the secondary
+       spotlight section, where we flag low volume but striking drugs
+   ===================================================================== */
+ 
+DROP TABLE IF EXISTS #drug_summary;
+ 
+SELECT
+    drug,
+    SUM(CASE WHEN age_bracket = '18-44' THEN n_cases ELSE 0 END) AS n_young,
+    SUM(CASE WHEN age_bracket = '18-44' THEN n_hosp  ELSE 0 END) AS n_hosp_young,
+    SUM(CASE WHEN age_bracket = '18-44' THEN n_death ELSE 0 END) AS n_death_young,
+    SUM(CASE WHEN age_bracket = '85+'   THEN n_cases ELSE 0 END) AS n_old,
+    SUM(CASE WHEN age_bracket = '85+'   THEN n_hosp  ELSE 0 END) AS n_hosp_old,
+    SUM(CASE WHEN age_bracket = '85+'   THEN n_death ELSE 0 END) AS n_death_old,
+    SUM(n_cases)                                                 AS n_total
+INTO #drug_summary
+FROM #agg
+GROUP BY drug;
+
+/* ====================================================================
+ i.  For each drug and each outcome, computing the rate in the youngest and
+   oldest brackets, then the ratio of old to young. The ratio is the
+   AGE PENALTY: how many times more often the outcome occurs in the
+   oldest patients compared to the youngest.
+ 
+   The 95 percent confidence interval uses the log normal approximation
+   for a ratio of proportions:
+     log(RR) plus or minus 1.96 times SE
+     where SE = sqrt( (1 - p_old)  / (n_old   * p_old)
+                    + (1 - p_young)/ (n_young * p_young) )
+    then exponentiating to bring the interval back to the ratio scale.
+ 
+   Justification:
+     - The log normal approximation is the standard formula taught in
+       epidemiology textbooks for the CI of a relative risk or ratio
+     - Wrapping every division in NULLIF and CASE WHEN avoids the SQL
+       errors that happen when a denominator is zero or when LOG hits zero
+     - Drugs with zero cases in either bracket get NULL for that
+       outcome's metrics, which is the honest answer: we cannot compute
+       a ratio when one side is empty
+   ===================================================================== */
+ 
+DROP TABLE IF EXISTS #leaderboard;
+ 
+WITH rates AS (
+    SELECT
+        drug,
+        n_young, n_old, n_total,
+        n_hosp_young, n_hosp_old,
+        n_death_young, n_death_old,
+        -- rates as proportions
+        CAST(n_hosp_young  AS FLOAT) / NULLIF(n_young, 0) AS p_hosp_young,
+        CAST(n_hosp_old    AS FLOAT) / NULLIF(n_old,   0) AS p_hosp_old,
+        CAST(n_death_young AS FLOAT) / NULLIF(n_young, 0) AS p_death_young,
+        CAST(n_death_old   AS FLOAT) / NULLIF(n_old,   0) AS p_death_old
+    FROM #drug_summary
+    WHERE n_young > 0 AND n_old > 0                  -- both brackets must have cases
+)
+SELECT
+    drug,
+    n_young, n_old, n_total,
+    n_hosp_young, n_hosp_old, n_death_young, n_death_old,
+ 
+    -- HOSPITALIZATION age penalty
+    p_hosp_young,
+    p_hosp_old,
+    CASE WHEN p_hosp_young > 0 AND p_hosp_old > 0
+         THEN p_hosp_old / p_hosp_young
+         ELSE NULL END AS hosp_age_ratio,
+    CASE WHEN p_hosp_young > 0 AND p_hosp_old > 0 AND p_hosp_young < 1 AND p_hosp_old < 1
+         THEN EXP(LOG(p_hosp_old / p_hosp_young)
+                  - 1.96 * SQRT(  (1 - p_hosp_old)   / (n_old   * p_hosp_old)
+                                + (1 - p_hosp_young) / (n_young * p_hosp_young)))
+         ELSE NULL END AS hosp_ratio_ci_lower,
+    CASE WHEN p_hosp_young > 0 AND p_hosp_old > 0 AND p_hosp_young < 1 AND p_hosp_old < 1
+         THEN EXP(LOG(p_hosp_old / p_hosp_young)
+                  + 1.96 * SQRT(  (1 - p_hosp_old)   / (n_old   * p_hosp_old)
+                                + (1 - p_hosp_young) / (n_young * p_hosp_young)))
+         ELSE NULL END AS hosp_ratio_ci_upper,
+ 
+    -- DEATH age penalty
+    p_death_young,
+    p_death_old,
+    CASE WHEN p_death_young > 0 AND p_death_old > 0
+         THEN p_death_old / p_death_young
+         ELSE NULL END AS death_age_ratio,
+    CASE WHEN p_death_young > 0 AND p_death_old > 0 AND p_death_young < 1 AND p_death_old < 1
+         THEN EXP(LOG(p_death_old / p_death_young)
+                  - 1.96 * SQRT(  (1 - p_death_old)   / (n_old   * p_death_old)
+                                + (1 - p_death_young) / (n_young * p_death_young)))
+         ELSE NULL END AS death_ratio_ci_lower,
+    CASE WHEN p_death_young > 0 AND p_death_old > 0 AND p_death_young < 1 AND p_death_old < 1
+         THEN EXP(LOG(p_death_old / p_death_young)
+                  + 1.96 * SQRT(  (1 - p_death_old)   / (n_old   * p_death_old)
+                                + (1 - p_death_young) / (n_young * p_death_young)))
+         ELSE NULL END AS death_ratio_ci_upper
+INTO #leaderboard
+FROM rates;
+ 
+-- Sanity check, peek at a few drugs
+SELECT TOP 20 * FROM #leaderboard ORDER BY n_total DESC;
+
+/* =====================================================================
+  j. Ranking drugs by the LOWER bound of the CI on the hospitalization age
+   penalty. Drugs at the top show a statistically supported pattern
+   of hospitalization rates climbing with age. Drugs with wide CIs
+   sink, since their lower bounds are small even when point estimates
+   look dramatic.
+ 
+   Justification:
+     - Ranking by the lower CI bound, not the point estimate, is the
+       standard pharmacovigilance practice. It rewards drugs where we
+       can be confident the elevation is real, while still keeping
+       uncertain ones in the analysis
+     - The TOP 50 cap keeps the output readable. Adjust upward when
+       you want to see further down the list
+   ===================================================================== */
+ 
+SELECT TOP 50
+    drug,
+    n_total,
+    n_young, n_old,
+    n_hosp_young, n_hosp_old,
+    ROUND(p_hosp_young, 4) AS rate_hosp_young,
+    ROUND(p_hosp_old,   4) AS rate_hosp_old,
+    ROUND(hosp_age_ratio,      2) AS age_ratio,
+    ROUND(hosp_ratio_ci_lower, 2) AS ci_lower,
+    ROUND(hosp_ratio_ci_upper, 2) AS ci_upper
+FROM #leaderboard
+WHERE hosp_ratio_ci_lower IS NOT NULL
+  AND hosp_ratio_ci_lower > 1                     
+ORDER BY hosp_ratio_ci_lower DESC;
+ 
+ /* =====================================================================
+  k. Ranking drugs by the LOWER bound of the CI on the death age penalty.
+    Mirror of Step j but for the death outcome. Drugs appearing at the
+    top of both leaderboards are the ones most likely to punish older
+    bodies through genuine drug pharmacology.
+
+    Caution: the top of this leaderboard will contain oncology and other
+    terminal disease drugs, where deaths reflect the underlying illness
+    rather than the medication. Step n handles that confounder with an
+    oncology sensitivity check.
+   ===================================================================== */
+ 
+SELECT TOP 50
+    drug,
+    n_total,
+    n_young, n_old,
+    n_death_young, n_death_old,
+    ROUND(p_death_young, 4) AS rate_death_young,
+    ROUND(p_death_old,   4) AS rate_death_old,
+    ROUND(death_age_ratio,      2) AS age_ratio,
+    ROUND(death_ratio_ci_lower, 2) AS ci_lower,
+    ROUND(death_ratio_ci_upper, 2) AS ci_upper
+FROM #leaderboard
+WHERE death_ratio_ci_lower IS NOT NULL
+  AND death_ratio_ci_lower > 1
+ORDER BY death_ratio_ci_lower DESC;
+
+
+/* =====================================================================
+   l. Surface drugs whose age penalty point estimate is striking but whose
+   small sample size leaves the CI wide. The main leaderboard would
+   bury them. This section honors the principle that statistical
+   insignificance does not mean the effect is not real, only that we
+   need more data to know.
+ 
+   These are SIGNALS WORTH FOLLOW UP, not conclusions.
+ 
+   Justification:
+     - The thresholds (ratio > 3, n_total < 100) are tunable defaults.
+       A ratio above 3 means the older bracket rate is more than triple
+       the younger bracket rate, which is large enough to be interesting
+       even with thin data
+     - Including this section is what separates a thoughtful project
+       from one that pretends statistical filtering equals truth
+   ===================================================================== */
+ 
+SELECT TOP 50
+    drug,
+    n_total, n_young, n_old,
+    n_hosp_young, n_hosp_old,
+    n_death_young, n_death_old,
+    ROUND(hosp_age_ratio,  2) AS hosp_ratio,
+    ROUND(death_age_ratio, 2) AS death_ratio,
+    ROUND(hosp_ratio_ci_lower,  2) AS hosp_ci_lower,
+    ROUND(death_ratio_ci_lower, 2) AS death_ci_lower
+FROM #leaderboard
+WHERE (hosp_age_ratio  > 3 OR death_age_ratio > 3)   -- striking point estimate
+  AND n_total < 100                                  -- small evidence base
+  AND (hosp_age_ratio IS NOT NULL OR death_age_ratio IS NOT NULL)
+ORDER BY n_total ASC;
+
+/* =====================================================================
+m. Pulling the five point age trajectory (one row per age bracket) for
+   every drug in the analysis, not just a hand picked few. The result
+   is a full raw dataset for visualization, ready to be exported
+   into Power BI, Tableau, or Excel.
+
+   Justification for going wide:
+     - Lets me decide which drugs to feature later inside Power BI,
+       using a slicer, instead of locking the choice in SQL
+     - Keeps the dataset reusable. 
+  ===================================================================== */
+
+SELECT
+    drug,                          -- the active ingredient identifier
+    age_bracket,                   -- one of the five age groups defined in Step 1
+    n_cases,                       -- total unique reports for this drug in this bracket
+    n_hosp,                        -- how many of those reports ended in hospitalization
+    n_death,                       -- how many ended in death
+
+    -- Hospitalization rate as a proportion between 0 and 1
+    -- CAST(... AS FLOAT) forces floating point division. Without it,
+    -- SQL Server would do integer division and most rates would round to 0
+    -- NULLIF(n_cases, 0) returns NULL instead of crashing the query
+    -- when a drug has zero cases in a bracket (division by zero protection)
+    -- ROUND( ..., 4) trims the result to four decimal places for readability
+    ROUND(CAST(n_hosp  AS FLOAT) / NULLIF(n_cases, 0), 4) AS rate_hosp,
+
+    -- Same logic applied to the death rate
+    ROUND(CAST(n_death AS FLOAT) / NULLIF(n_cases, 0), 4) AS rate_death
+
+FROM #agg                          -- the per drug per age bracket aggregate built in Step 4
+
+-- Sorting by drug then age_bracket keeps all five trajectory points
+-- for each drug sitting together as a contiguous block. Easier to
+-- read in the result pane and easier to scan visually before exporting.
+ORDER BY drug, age_bracket;
+
+/* =====================================================================
+   LIMITATIONS AND HONEST NEXT STEPS
+   ---------------------------------------------------------------------
+   1. FAERS counts reports, not patients. Every number above is a
+      report rate, never a true incidence in the population taking
+      the drug. The story is always comparative.
+ 
+   2. The death leaderboard will be dominated by drugs used in serious
+      and terminal illness. Run a sensitivity analysis excluding the
+      top oncology, ALS, advanced heart failure, and advanced HIV
+      drugs, and compare the leaderboards before and after.
+ 
+   3. Single quarter limits statistical power. Loading two or three
+      additional quarters (older, like 2021 Q1, and newer, like 2025 Q4)
+      would tighten every CI and let you add a temporal trend showing
+      whether age penalties grew over time.
+ 
+   4. The age penalty defined here is a simple ratio between two
+      brackets. A more sophisticated version would fit a regression
+      across all five brackets and use the slope. Reasonable upgrade
+      for a v2.
+ 
+   5. Reporting bias varies by drug. New, heavily marketed drugs
+      attract more reports per actual user than older drugs. Keep that
+      in mind when comparing across drug ages and approval dates.
+  ===================================================================== */
+
+
+  /* =====================================================================
+   n. Oncology sensitivity check on the death leaderboard
+   ---------------------------------------------------------------------
+   Rebuilding the death leaderboard with common cancer drugs excluded,
+   so the surviving signal reflects drugs that punish older bodies
+   through their own pharmacology, not through the underlying illness
+   they treat.
+
+   Justification:
+     - Cancer drugs concentrate at the top of any death leaderboard
+       because cancer patients die, not because the drug killed them.
+       Excluding them lets the truly drug driven signals breathe
+     - Building the exclusion list as a temp table keeps it tunable.
+     - LIKE patterns catch variants like "RIBOCICLIB SUCCINATE" or
+       combo products that an exact match would miss
+  ===================================================================== */
+
+DROP TABLE IF EXISTS #oncology_patterns;
+CREATE TABLE #oncology_patterns (pattern VARCHAR(100));
+
+INSERT INTO #oncology_patterns (pattern) VALUES
+    -- Cancer drugs that surfaced in the death leaderboard
+    ('RIBOCICLIB'), ('ABEMACICLIB'), ('PALBOCICLIB'),
+    ('OLAPARIB'), ('NIRAPARIB'), ('TALAZOPARIB'),
+    ('PEMBROLIZUMAB'), ('NIVOLUMAB'), ('ATEZOLIZUMAB'),
+    ('DURVALUMAB'), ('IPILIMUMAB'),
+    ('CAPECITABINE'), ('FLUOROURACIL'),
+    ('LENALIDOMIDE'), ('POMALIDOMIDE'),
+    ('OSIMERTINIB'), ('ERLOTINIB'), ('GEFITINIB'),
+    ('LETROZOLE'), ('ANASTROZOLE'), ('EXEMESTANE'),
+    -- Common classical chemotherapy
+    ('CISPLATIN'), ('CARBOPLATIN'), ('OXALIPLATIN'),
+    ('DOXORUBICIN'), ('PACLITAXEL'), ('DOCETAXEL'),
+    ('GEMCITABINE'), ('IRINOTECAN'), ('ETOPOSIDE'),
+    ('VINCRISTINE'), ('CYCLOPHOSPHAMIDE'),
+    -- Common targeted oncology therapies
+    ('IMATINIB'), ('DASATINIB'),
+    ('SORAFENIB'), ('SUNITINIB'),
+    ('IBRUTINIB'), ('ACALABRUTINIB'),
+    ('BEVACIZUMAB'), ('TRASTUZUMAB'), ('CETUXIMAB'),
+    ('BORTEZOMIB'), ('CARFILZOMIB'),
+    ('VENETOCLAX'), ('TAMOXIFEN'),
+    ('ENZALUTAMIDE'), ('ABIRATERONE');
+
+-- Death leaderboard with oncology drugs filtered out
+SELECT TOP 50
+    lb.drug,
+    lb.n_total,
+    lb.n_young, lb.n_old,
+    lb.n_death_young, lb.n_death_old,
+    ROUND(lb.p_death_young, 4) AS rate_death_young,
+    ROUND(lb.p_death_old,   4) AS rate_death_old,
+    ROUND(lb.death_age_ratio,      2) AS age_ratio,
+    ROUND(lb.death_ratio_ci_lower, 2) AS ci_lower,
+    ROUND(lb.death_ratio_ci_upper, 2) AS ci_upper
+FROM #leaderboard AS lb
+WHERE lb.death_ratio_ci_lower IS NOT NULL
+  AND lb.death_ratio_ci_lower > 1
+  -- NOT EXISTS removes any drug whose name contains an oncology pattern
+  AND NOT EXISTS (
+        SELECT 1
+        FROM #oncology_patterns AS op
+        WHERE lb.drug LIKE '%' + op.pattern + '%'
+  )
+ORDER BY lb.death_ratio_ci_lower DESC;
+
+ /* =====================================================================
+Finish
+===================================================================== */
